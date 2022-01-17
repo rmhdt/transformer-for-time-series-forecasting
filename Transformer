@@ -1,0 +1,550 @@
+import math
+
+import numpy as np
+import tensorflow as tf
+#from nasdaq import get_data
+from elec_data_set import get_data
+
+from elec_test_data import get_test_data
+import matplotlib.pyplot as plt
+
+tr_data = []
+te_data = []
+scaler = []
+
+def get_mean_std(x: tf.Tensor):
+    mean = tf.reduce_mean(x, axis=-1, keepdims=True)
+    squared = tf.square(x - mean)
+    variance = tf.reduce_mean(squared, axis=-1, keepdims=True)
+    std = tf.sqrt(variance)
+
+    return mean, std
+
+def layer_norm(layer: tf.Tensor):
+    with tf.variable_scope("norm"):
+        scale = tf.get_variable("scale", shape=layer.shape[-1], dtype=tf.float32)
+        base = tf.get_variable("base", shape=layer.shape[-1], dtype=tf.float32)
+        mean, std = get_mean_std(layer)
+
+        norm = (layer - mean) / (std + 1e-6)
+        return norm * scale + base
+
+
+def attention(query: tf.Tensor, key: tf.Tensor, value: tf.Tensor, *,
+              mask: tf.Tensor,
+              keep_prob: float):
+    d_k = query.shape[-1].value
+
+    scores = tf.matmul(query, tf.transpose(key, perm=[0, 1, 3, 2]))
+    scores = scores / tf.constant(math.sqrt(d_k))
+
+    mask_add = ((scores * 0) - 1e9) * (tf.constant(1.) - mask)
+    scores = scores * mask + mask_add
+
+    attn = tf.nn.softmax(scores, axis=-1)
+    attn = tf.nn.dropout(attn, keep_prob)
+
+    return tf.matmul(attn, value), attn
+
+def prepare_for_multi_head_attention(x: tf.Tensor, heads: int, name: str):
+    n_batches, seq_len, d_model = x.shape
+
+    #assert d_model % heads == 0
+    #d_k = d_model // heads
+    d_k = 20
+    uni = d_k * heads
+    #if name=='value':
+      #uni = d_model
+      #d_k = d_model//heads
+
+    x = tf.keras.layers.Dense(units=uni, name=name)(x)
+    x = tf.reshape(x, shape=[n_batches, seq_len, heads, d_k])
+    x = tf.transpose(x, perm=[0, 2, 1, 3])
+    return x
+
+def multi_head_attention(query: tf.Tensor, key: tf.Tensor, value: tf.Tensor, *,
+                         mask: tf.Tensor,
+                         heads: int,
+                         keep_prob: float):
+    with tf.variable_scope("multi_head"):
+        n_batches, seq_len, d_model = query.shape
+
+        query = prepare_for_multi_head_attention(query, heads, "query")
+        key = prepare_for_multi_head_attention(key, heads, "key")
+        value = prepare_for_multi_head_attention(value, heads, "value")
+
+        mask = tf.expand_dims(mask, axis=1)
+        out, _ = attention(query, key, value, mask=mask, keep_prob=keep_prob)
+        out = tf.transpose(out, perm=[0, 2, 1, 3])
+        out = tf.reshape(out, shape=[n_batches, seq_len, 160])
+        return tf.keras.layers.Dense(units=d_model, name="attention")(out)
+
+
+def feed_forward(x: tf.Tensor,
+                 d_model: int, d_ff: int, keep_prob: float):
+    with tf.variable_scope("feed_forward"):
+        hidden = tf.keras.layers.Dense(units=d_ff, name="hidden")(x)
+        hidden = tf.nn.relu(hidden)
+        hidden = tf.nn.dropout(hidden, keep_prob=keep_prob)
+        return tf.keras.layers.Dense(units=d_model, name="out")(hidden)
+
+
+def encoder_layer(x: tf.Tensor, *,
+                  mask: tf.Tensor, index: int, heads: int,
+                  keep_prob: float, d_ff: int):
+    d_model = x.shape[-1]
+
+    with tf.variable_scope(f"attention_{index}"):
+        attention_out = multi_head_attention(x, x, x,
+                                             mask=mask, heads=heads, keep_prob=keep_prob)
+        added = x + tf.nn.dropout(attention_out, keep_prob)
+        x = layer_norm(added)
+
+    with tf.variable_scope(f"ff_{index}"):
+        ff_out = feed_forward(x, d_model, d_ff, keep_prob)
+        added = x + tf.nn.dropout(ff_out, keep_prob)
+        return layer_norm(added)
+
+def encoder(x: tf.Tensor, *,
+            mask: tf.Tensor,
+            n_layers: int,
+            heads: int, keep_prob: float, d_ff: int):
+    with tf.variable_scope("encoder"):
+        for i in range(n_layers):
+            x = encoder_layer(x,
+                              mask=mask, index=i,
+                              heads=heads, keep_prob=keep_prob, d_ff=d_ff)
+
+        return x
+
+def decoder_layer(encoding: tf.Tensor, x: tf.Tensor, *,
+                  enc_mask: tf.Tensor, mask: tf.Tensor,
+                  index: int, heads: int, keep_prob: float, d_ff: int):
+    d_model = encoding.shape[-1]
+    with tf.variable_scope(f"{index}_self_attention"):
+        attention_out = multi_head_attention(x, x, x,
+                                             mask=mask, heads=heads, keep_prob=keep_prob)
+        added = x + tf.nn.dropout(attention_out, keep_prob=keep_prob)
+        x = layer_norm(added)
+    with tf.variable_scope(f"{index}_encoding_attention"):
+        attention_out = multi_head_attention(x, encoding, encoding,
+                                             mask=enc_mask, heads=heads, keep_prob=keep_prob)
+        added = x + tf.nn.dropout(attention_out, keep_prob=keep_prob)
+        x = layer_norm(added)
+    with tf.variable_scope(f"{index}_ff"):
+        ff_out = feed_forward(x, d_model, d_ff, keep_prob)
+        added = x + tf.nn.dropout(ff_out, keep_prob)
+        return layer_norm(added)
+
+def decoder(encoding: tf.Tensor, x: tf.Tensor, *,
+            enc_mask: tf.Tensor, mask: tf.Tensor,
+            n_layers: int,
+            heads: int, keep_prob: float, d_ff: int):
+    with tf.variable_scope("decoder"):
+        for i in range(n_layers):
+            x = decoder_layer(encoding, x,
+                              enc_mask=enc_mask, mask=mask, index=i,
+                              heads=heads, keep_prob=keep_prob, d_ff=d_ff)
+
+        return x
+
+def get_embeddings(input_ids: tf.Tensor, output_ids: tf.Tensor,
+                   d_inp:int, d_model: int):
+    word_embeddings = None
+    d_model = int(d_model/2)
+    
+    with tf.variable_scope("inp_embed"):
+      #in_emb = tf.layers.dense(input_ids, kernel_initializer=tf.initializers.random_normal(), units=d_model,
+      #                          name="in_emb2")
+      #in_emb = tf.nn.relu(in_emb)
+      #in_emb = tf.layers.dense(in_emb, kernel_initializer=tf.initializers.random_normal(), units=d_model,
+      #                          name="in_emb3")
+      #in_emb = tf.nn.relu(in_emb)
+      
+      #in_emb = tf.layers.dense(in_emb, kernel_initializer=tf.initializers.random_normal(), units=d_model,
+      #                          name="in_emb4")
+      #in_emb = layer_norm(in_emb)
+      in_emb = input_ids
+      
+    with tf.variable_scope("out_embed"):
+
+      #out_emb = tf.layers.dense(output_ids, kernel_initializer=tf.initializers.random_normal(), units=d_model,
+      #                          name="out_emb2")
+      #out_emb = tf.nn.relu(out_emb)
+      #out_emb = tf.layers.dense(out_emb, kernel_initializer=tf.initializers.random_normal(), units=d_model,
+      #                          name="out_emb3")
+      #out_emb = tf.nn.relu(out_emb)
+      
+      #out_emb = tf.layers.dense(out_emb, kernel_initializer=tf.initializers.random_normal(), units=d_model,
+      #                          name="out_emb4")
+      #out_emb = layer_norm(out_emb)
+      out_emb = output_ids
+
+    
+    return word_embeddings, in_emb, out_emb
+
+def generate_positional_encodings(d_model: int,batch_size: int, in_len: int, out_len):
+    in_emb = tf.constant(np.arange(0, in_len).reshape(in_len))
+    in_emb = tf.one_hot(in_emb, depth=174)
+    in_emb = tf.expand_dims(in_emb, axis=0)
+    in_emb = tf.tile(in_emb, multiples=[batch_size,1,1])
+    
+    out_emb = tf.constant(np.arange(0, out_len).reshape(out_len))
+    out_emb = tf.one_hot(out_emb, depth=174)
+    out_emb = tf.expand_dims(out_emb, axis=0)
+    out_emb = tf.tile(out_emb, multiples=[batch_size,1,1])
+    
+    return in_emb, out_emb
+
+def prepare_embeddings(x: tf.Tensor, *,
+                       positional_encodings: tf.Tensor,
+                       keep_prob: float):
+    with tf.variable_scope('add_on_hot_pos_enc'):
+        _, seq_len, _ = x.shape
+        x = tf.concat([x,positional_encodings], axis=-1)
+        x = tf.nn.dropout(x, keep_prob)
+        return x
+
+def generator(x: tf.Tensor, d_model:int, inp_dim):
+    #res = tf.layers.dense(x, units=vocab_size, name="generator")
+    
+    #x = tf.layers.dense(x, units=d_model, name="out_1")
+    #x = tf.nn.relu(x)
+    mean = tf.sigmoid(tf.layers.dense(x, units=inp_dim, name="mean"))
+    std = tf.sigmoid(tf.layers.dense(x, units=inp_dim, name="std"))
+    #std = tf.log(1 + tf.exp(tf.layers.dense(x, units=inp_dim, name="std")))
+    
+    x = tf.concat([mean, std], axis=-1)
+    #x = tf.nn.relu(x)
+    #x = tf.layers.dense(x, units=64, name="out_3")
+    #x = tf.nn.relu(x)
+      
+    #x = tf.layers.dense(x, units=10, name="out_4")
+    return x
+
+def get_results(x: tf.Tensor, batch_size, d_inp):
+
+    return x[:,:,0:d_inp]
+
+def label_smoothing_loss(results: tf.Tensor, expected: tf.Tensor,
+                         d_inp: int, smoothing: float):
+    #results = tf.reshape(results, shape=(-1, 10, 2))
+    mean = results[:,:,0:d_inp]
+    mean = tf.reshape(mean, shape=(-1, 1))
+    std = results[:,:,d_inp:2*d_inp]
+    std = tf.reshape(std, shape=(-1, 1))
+
+    expected = tf.reshape(expected, shape=(-1, 1))
+    
+    a = tf.square(expected - mean)
+    b = 2 * tf.square(std)
+    
+    c = tf.divide(a,b)
+    d = tf.log(std)
+    
+    return tf.reduce_sum(c) + tf.reduce_sum(d)
+
+    #confidence = 1 - smoothing
+    #smoothing = smoothing / (vocab_size - 1)
+
+    #expected = tf.one_hot(expected, depth=vocab_size) * (confidence - smoothing)
+    #expected += smoothing
+
+    #results = tf.distributions.Categorical(logits=results)
+    #expected = tf.distributions.Categorical(logits=expected)
+    #return tf.reduce_mean(tf.square(results - expected))
+
+def generate_data(batch_size: int, seq_len: int, seq_out: int, epoch: int,
+                  index: int, is_train: bool):
+
+    if is_train:
+      
+      arr = np.arange(5832 - seq_len - seq_out)
+      np.random.seed(epoch)
+      np.random.shuffle(arr)
+      inputs = []
+      outputs = []
+      
+      for i in range(batch_size):
+          st = arr[index*batch_size + i]
+          inp = tr_data[st:st+seq_len]
+          out = tr_data[st+seq_len:st+seq_len + seq_out + 1]
+
+          inputs.append(inp)
+          outputs.append(out)
+
+      inputs = np.array(inputs)
+      outputs = np.array(outputs)
+    
+    else:
+      arr = np.arange(2928 - seq_len - seq_out)
+      np.random.seed(epoch)
+      np.random.shuffle(arr)
+      inputs = []
+      outputs = []
+      
+      for i in range(batch_size):
+          st = arr[index*batch_size + i]
+          inp = te_data[st:st+seq_len]
+          out = te_data[st+seq_len:st+seq_len + seq_out + 1]
+
+          inputs.append(inp)
+          outputs.append(out)
+
+      inputs = np.array(inputs)
+      outputs = np.array(outputs)
+
+    return inputs, outputs
+
+def noam_learning_rate(step: int, warm_up: float, d_model: int):
+    #return .0008/math.sqrt(int(step/87)+1)
+    #return .001*math.exp(-step*.0005)
+    return (d_model ** -.5) * min(step ** -.65, step * warm_up ** -1.35)
+
+
+def output_subsequent_mask(seq_len: int):
+    mask = np.zeros((seq_len, seq_len), dtype=float)
+    for i in range(seq_len):
+        for j in range(i + 1):
+            mask[i, j] = 1.
+
+    return mask
+
+
+def train():
+    seq_length = 168
+    seq_out = 27
+
+    batch_size = 16  # 12000
+    d_inp = 370  # 512
+    d_model = 544
+    heads = 8
+    #keep_prob = .9
+    n_layers = 2   # 6
+    d_ff = 544  # 2048
+    keep_prob = tf.placeholder(dtype=tf.float32, shape=(), name="keep_prob")
+
+    inpt_pos_enc, outpt_pos_enc = generate_positional_encodings(d_inp, batch_size,
+                                                               seq_length, seq_out)
+    inputs = tf.placeholder(dtype=tf.float32,
+                            shape=(batch_size, seq_length, d_inp), name="input")
+    outputs = tf.placeholder(dtype=tf.float32,
+                             shape=(batch_size, seq_out, d_inp), name="output")
+    expected = tf.placeholder(dtype=tf.float32,
+                              shape=(batch_size, seq_out, d_inp), name="expected")
+    inputs_mask = tf.placeholder(dtype=tf.float32,
+                                 shape=(1, seq_length, seq_length),
+                                 name="input_mask")
+    enc_dec_mask = tf.placeholder(dtype=tf.float32,
+                                 shape=(1, seq_out, seq_length),
+                                 name="input_dec_mask")
+    output_mask = tf.placeholder(dtype=tf.float32,
+                                 shape=(1, seq_out, seq_out),
+                                 name="output_mask")
+    learning_rate = tf.placeholder(dtype=tf.float32, name="learning_rate")
+
+    w_embed, input_embeddings, output_embeddings = get_embeddings(inputs, outputs,
+                                                                  d_inp, d_model)
+    input_embeddings = prepare_embeddings(input_embeddings,
+                                          positional_encodings=inpt_pos_enc,
+                                          keep_prob=keep_prob)
+    output_embeddings = prepare_embeddings(output_embeddings,
+                                           positional_encodings=outpt_pos_enc,
+                                           keep_prob=keep_prob)
+
+    encoding = encoder(input_embeddings, mask=inputs_mask, n_layers=n_layers, heads=heads,
+                       keep_prob=keep_prob, d_ff=d_ff)
+    decoding = decoder(encoding, output_embeddings,
+                       enc_mask=enc_dec_mask, mask=output_mask,
+                       n_layers=n_layers, heads=heads, keep_prob=keep_prob, d_ff=d_ff)
+    log_results = generator(decoding, d_model, d_inp)
+    #results = tf.exp(log_results)
+    results = get_results(log_results, batch_size, d_inp)
+
+    loss = label_smoothing_loss(log_results, expected, d_inp, smoothing=0.0)
+
+    #adam = tf.train.AdamOptimizer(learning_rate=learning_rate, beta1=0.9, beta2=0.98, epsilon=1e-9)
+    adam = tf.train.AdamOptimizer(learning_rate=learning_rate)
+    params = tf.trainable_variables()
+    
+    lossL2 = tf.add_n([ tf.nn.l2_loss(v) for v in params
+                    if 'bias' not in v.name ]) * 0.05
+    
+    grads, _ = tf.clip_by_global_norm(tf.gradients(loss, params), 50.)
+    grads_and_vars = list(zip(grads, params))
+    train_op = adam.apply_gradients(grads_and_vars, name="apply_gradients")
+
+    warm_up = 2000
+    #batch_in_mask = np.ones((1, 1, seq_length), dtype=float)
+    #batch_enc_dec_mask = np.ones((1, 1, seq_length), dtype=float)
+    batch_enc_dec_mask = np.zeros((1, seq_out, seq_length), dtype=float)
+    for i in range(seq_out):
+      indexes = np.arange(i%24, seq_out, 24)
+      batch_enc_dec_mask[0, i, indexes] = 1
+    
+    
+    #batch_in_mask = np.ones((1, 1, seq_length), dtype=float)
+    
+    #batch_in_mask = np.zeros((1, seq_length, seq_length), dtype=float)
+    #for n in range(seq_length):
+    #  st = max(0, n-k)
+    #  batch_in_mask[0, n, 0 :n+1] = 1
+    batch_in_mask = np.zeros((1, seq_length, seq_length), dtype=float)
+    for n in range(seq_length):
+      st = int(n/24) * 24
+      batch_in_mask[0, n, st :st+24] = 1
+    
+    total_parameters = 0
+    for variable in tf.trainable_variables():
+        # shape is an array of tf.Dimension
+        shape = variable.get_shape()
+        variable_parameters = 1
+        for dim in shape:
+            variable_parameters *= dim.value
+        total_parameters += variable_parameters
+    print(total_parameters)
+        
+    
+    batch_out_mask = output_subsequent_mask(seq_out)
+    batch_out_mask = batch_out_mask.reshape(1, seq_out, seq_out)
+
+    train_iter = int((5832-seq_length-seq_out+1)/batch_size)
+    test_iter = int((2928-seq_length-seq_out+1)/batch_size)
+    print(train_iter)
+    print(test_iter)
+
+    with tf.Session() as session:
+        session.run(tf.global_variables_initializer())
+        epoch = 0
+        for i in range(100_000):
+            lr = noam_learning_rate(i + 1, warm_up, d_model)
+            if i%train_iter==0:
+              epoch+=1
+
+            batch_in, batch_out = generate_data(batch_size, seq_length, seq_out,
+                                                epoch, i%train_iter, True)
+
+            _, batch_loss, batch_res = session.run([train_op, loss, results],
+                                                   feed_dict={
+                                                       keep_prob: .95,
+                                                       learning_rate: lr,
+                                                       inputs: batch_in,
+                                                       outputs: batch_out[:, :-1],
+                                                       expected: batch_out[:, 1:],
+                                                       inputs_mask: batch_in_mask,
+                                                       enc_dec_mask: batch_enc_dec_mask,
+                                                       output_mask: batch_out_mask
+                                                   })
+
+
+            if i % 400 == 0:
+                print(f"step={i}\tloss={batch_loss: .6f}")
+                #print(f"inp=  {(batch_in[0,:,0])}")
+                #print(f"exp={(batch_out[0,1:21,0])}")
+                #print(f"res=  {(batch_res[0,:20,0])}")
+            
+
+            if i % 400 == 0:
+              err = 0
+              for n in range(test_iter):#42
+
+                    batch_in, batch_out = generate_data(batch_size, seq_length, seq_out,
+                                                        0, n, False)
+                    batch_loss, batch_res = session.run([loss, results],
+                                                            feed_dict={
+                                                                keep_prob: 1,
+                                                                inputs: batch_in,
+                                                                outputs: batch_out[:,:-1],
+                                                                expected: batch_out[:,1:],
+                                                                inputs_mask: batch_in_mask,
+                                                                enc_dec_mask: batch_enc_dec_mask,
+                                                                output_mask: batch_out_mask
+                                                            })
+                    err += batch_loss
+              print('mean loss on test')
+              print(err/test_iter) 
+            
+
+
+            if i%500 == 0 :
+              
+              nmse = 0
+              nd = 0
+              for_time = seq_out - 3
+              for n in range(test_iter):#42
+
+                batch_in, batch_out = generate_data(batch_size, seq_length, seq_out,
+                                                    0, n, False)
+                batch_loss, batch_res, batch_enc = session.run([loss, results, encoding],
+                                                        feed_dict={
+                                                            keep_prob: 1,
+                                                            inputs: batch_in,
+                                                            outputs: batch_out[:,:-1],
+                                                            expected: batch_out[:,1:],
+                                                            inputs_mask: batch_in_mask,
+                                                            enc_dec_mask: batch_enc_dec_mask,
+                                                            output_mask: batch_out_mask
+                                                        })
+                
+                expect = np.copy(batch_out[:, 1:])
+                bout = np.copy(batch_out[:, :-1])
+
+                for j in range(3, seq_out):
+                    batch_loss, batch_res = session.run([loss, results],
+                                                        feed_dict={
+                                                            keep_prob: 1,
+                                                            encoding: batch_enc,
+                                                            outputs: bout,
+                                                            expected: expect,
+                                                            inputs_mask: batch_in_mask,
+                                                            enc_dec_mask: batch_enc_dec_mask,
+                                                            output_mask: batch_out_mask
+                                                        })
+
+                    if j < seq_out - 1:
+                        bout[:, j +1] = batch_res[:, j]
+                
+                expect = expect[:,3:,:]
+                batch_res = batch_res[:,3:,:]
+                
+                expect = expect.reshape((-1, d_inp))
+                expect = scaler.inverse_transform(expect)
+                expect = expect.reshape((batch_size, -1))
+                
+                batch_res = batch_res.reshape((-1, d_inp))
+                batch_res = scaler.inverse_transform(batch_res)
+                batch_res = batch_res.reshape((batch_size,-1))
+                
+                nds = np.absolute(expect - batch_res)
+                nds = np.sum(nds, axis=-1)
+                ndm = np.absolute(expect)
+                ndm = np.sum(ndm, axis=-1)
+                nd += np.sum(nds/ndm)
+                
+                
+                dif = expect - batch_res
+                sq = np.square(dif)
+                add = np.sum(sq, axis=-1)
+                add = add/(d_inp*for_time)
+                add = np.sqrt(add)
+                
+                div = np.sum(np.abs(expect), axis=-1)/(d_inp*for_time)
+                
+                nmse += np.sum(add/div)
+              print('nmse')
+              print(nmse/(test_iter*batch_size))
+              print('nds')
+              print(nd/(test_iter*batch_size))
+                
+                
+                
+                
+                
+if __name__ == '__main__':
+    #tr_data, te_data, scalser = get_data()
+    tr_data, scaler = get_data()
+    te_data = get_test_data(scaler)
+    print(tr_data.shape)
+    print(te_data.shape)
+    print('train started.')
+    train()
