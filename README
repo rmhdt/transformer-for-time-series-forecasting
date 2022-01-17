@@ -1,0 +1,4 @@
+This repository contains an implementation for time series prediction with transformer model
+written in python using TensorFlow, based on the 
+A transformer self-attention model for time series forecasting
+paper.
